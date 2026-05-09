@@ -6,7 +6,7 @@ Backend em Python para um **super assistente pessoal** com texto, voz, calendár
 
 ## 1. Visão geral
 
-O MAX não deve ser apenas um app de tarefas.  
+O MAX não deve ser apenas um app de tarefas.
 Ele deve funcionar como um **backend de eventos pessoais**, onde tudo que acontece vira dado para o assistente tomar decisões.
 
 Exemplo:
@@ -40,7 +40,7 @@ SQLAlchemy 2
 Alembic
 PostgreSQL
 Redis
-Celery ou Dramatiq
+Celery + Celery Beat
 JWT/Auth
 WebSocket
 ```
@@ -185,18 +185,36 @@ max_backend/
         service.py
         vector_store.py
 
+      integrations/
+        router.py
+        schemas.py
+        models.py
+        service.py
+        google_calendar.py
+        outlook.py
+
       realtime/
         websocket.py
         manager.py
         events.py
 
       ai/
+        providers/
+          base.py           ← interface comum (BaseLLMProvider)
+          openai.py
+          gemini.py
+          anthropic.py
+
+        engines/
+          context_engine.py
+          decision_engine.py
+          memory_engine.py
+          habit_engine.py
+
         router.py
         schemas.py
-        service.py
-        context_engine.py
-        decision_engine.py
-        llm_client.py
+        service.py          ← orquestra engines e providers
+        prompts.py
 
     workers/
       celery_app.py
@@ -428,7 +446,7 @@ POST /tasks/{id}/complete
 
 ## 12. Módulo de calendário
 
-No MVP, criar calendário interno primeiro.  
+No MVP, criar calendário interno primeiro.
 Depois integrar com Google Calendar, Outlook e calendário local do celular.
 
 ### Tabela: calendar_events
@@ -658,7 +676,7 @@ updated_at
 
 ```json
 {
-  "wake_word": "Nexa",
+  "wake_word": "MAX",
   "speak_enabled": true,
   "proactive_enabled": true,
   "quiet_hours_start": "22:00",
@@ -669,16 +687,58 @@ updated_at
 
 ---
 
-## 18. Motor de contexto
+## 18. Módulo de IA — Providers e Engines
 
-Arquivos:
+A IA do MAX é dividida em duas camadas: **quem fala** (providers) e **quem pensa** (engines).
+
+### Providers — conexão com APIs externas
 
 ```txt
-ai/context_engine.py
-ai/decision_engine.py
+ai/providers/base.py      ← interface comum BaseLLMProvider
+ai/providers/openai.py    ← cliente OpenAI
+ai/providers/gemini.py    ← cliente Google Gemini
+ai/providers/anthropic.py ← cliente Anthropic
 ```
 
-O Context Engine recebe:
+Todos implementam a mesma interface:
+
+```python
+class BaseLLMProvider:
+    async def complete(prompt, context) -> str
+    async def embed(text) -> list[float]
+```
+
+Isso permite trocar de modelo mudando uma linha, sem tocar na lógica.
+
+### Engines — inteligência do MAX
+
+```txt
+ai/engines/context_engine.py   ← monta o contexto situacional
+ai/engines/decision_engine.py  ← decide o que fazer
+ai/engines/memory_engine.py    ← recupera e salva memórias
+ai/engines/habit_engine.py     ← analisa padrões de comportamento
+```
+
+Os engines não sabem qual provider estão usando. Recebem o provider por injeção:
+
+```python
+class DecisionEngine:
+    def __init__(self, llm: BaseLLMProvider):
+        self.llm = llm
+
+    async def decide(self, context: Context) -> Decision:
+        response = await self.llm.complete(...)
+```
+
+### Uso por modelo recomendado
+
+```txt
+Decisões rápidas e baratas    → Gemini Flash
+Análise profunda de contexto  → GPT-4o ou Claude
+Embeddings de memória         → OpenAI text-embedding
+```
+
+### O Context Engine recebe
 
 ```txt
 tarefas
@@ -724,7 +784,7 @@ Exemplo de retorno:
 
 ## 20. Memória
 
-No MVP, memória simples em PostgreSQL.  
+No MVP, memória simples em PostgreSQL.
 Depois, memória vetorial com pgvector.
 
 ### Tabela: memory_entries
@@ -736,9 +796,13 @@ type
 content
 importance
 source
+embedding    ← nullable, reservado para pgvector
 created_at
 updated_at
 ```
+
+> A coluna `embedding` deve ser criada como `nullable` desde o início.
+> Quando pgvector for ativado, a migration será simples e sem perda de dados.
 
 ### Tipos
 
@@ -908,6 +972,17 @@ Usar WebSocket para sincronização em tempo real entre PC e celular.
 }
 ```
 
+### Heartbeat
+
+Conexões mobile caem silenciosamente sem sinalização. Implementar heartbeat obrigatório:
+
+```json
+{ "type": "ping" }
+{ "type": "pong" }
+```
+
+O cliente envia `ping` a cada 30 segundos. Se o servidor não responder com `pong`, o cliente reconecta automaticamente.
+
 ---
 
 ## 25. Workers
@@ -937,38 +1012,20 @@ workers/
 
 ---
 
-## 26. Celery ou Dramatiq?
+## 26. Por que Celery
 
-### Celery
+O MAX precisa de **tarefas agendadas** desde o início: resumo diário às 8h, análise de hábitos à meia-noite, lembretes periódicos. Celery Beat (scheduler embutido no Celery) resolve isso nativamente. Dramatiq exigiria uma lib extra e uma possível reescrita futura.
 
-Vantagens:
+### Comparativo
 
-```txt
-maduro
-muito usado
-bom para produção
-muitos recursos
-bom para tarefas agendadas
-```
+| | Celery | Dramatiq |
+|---|---|---|
+| Maturidade | Alta (~2009) | Média (~2017) |
+| Tarefas agendadas | Celery Beat incluso | Lib extra necessária |
+| Complexidade | Maior | Menor |
+| Produção | Padrão de mercado | Menos comum |
 
-### Dramatiq
-
-Vantagens:
-
-```txt
-mais simples
-mais limpo
-ótimo para MVP
-boa performance
-menos burocrático
-```
-
-### Recomendação
-
-```txt
-MVP rápido: Dramatiq + Redis
-Produto robusto: Celery + Redis/RabbitMQ
-```
+**Recomendação: Celery + Redis desde o início.**
 
 ---
 
@@ -1115,15 +1172,26 @@ services:
       - redis
       - db
 
+  beat:
+    build: .
+    command: celery -A app.workers.celery_app beat --loglevel=info
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - db
+
 volumes:
   max_postgres_data:
 ```
+
+> O serviço `beat` é o scheduler do Celery. Ele dispara os jobs agendados (resumo diário, análise de hábitos, etc).
 
 ---
 
 ## 30. Dependências iniciais
 
-Arquivo `requirements.txt` sugerido:
+Arquivo `requirements.txt`:
 
 ```txt
 fastapi
@@ -1136,6 +1204,7 @@ asyncpg
 alembic
 redis
 celery
+celery[redis]
 python-jose[cryptography]
 passlib[bcrypt]
 python-multipart
@@ -1149,6 +1218,10 @@ pytest-asyncio
 ruff
 mypy
 openai
+anthropic
+google-generativeai
+pgvector
+tiktoken
 ```
 
 ---
@@ -1172,6 +1245,7 @@ REFRESH_TOKEN_EXPIRE_DAYS=30
 
 OPENAI_API_KEY=
 GEMINI_API_KEY=
+ANTHROPIC_API_KEY=
 
 DEFAULT_TIMEZONE=America/Recife
 ```
@@ -1183,24 +1257,26 @@ DEFAULT_TIMEZONE=America/Recife
 Ordem recomendada:
 
 ```txt
-1. Criar projeto FastAPI
-2. Configurar PostgreSQL
-3. Configurar SQLAlchemy async
-4. Configurar Alembic
-5. Criar auth
-6. Criar users
-7. Criar devices
-8. Criar tasks
-9. Criar calendar
-10. Criar reminders
-11. Criar events ingest
-12. Criar screen time
-13. Criar assistant profiles
-14. Criar notifications
-15. Criar context engine
-16. Criar chat com IA
-17. Criar WebSocket sync
-18. Criar workers
+1.  Criar projeto FastAPI
+2.  Configurar PostgreSQL
+3.  Configurar SQLAlchemy async
+4.  Configurar Alembic
+5.  Configurar Redis + Celery + Celery Beat
+6.  Criar auth
+7.  Criar users
+8.  Criar devices
+9.  Criar tasks
+10. Criar calendar
+11. Criar reminders
+12. Criar events ingest
+13. Criar screen time
+14. Criar assistant profiles
+15. Criar notifications
+16. Criar context engine (ai/engines)
+17. Criar providers (ai/providers)
+18. Criar chat com IA
+19. Criar WebSocket sync + heartbeat
+20. Criar workers e jobs agendados
 ```
 
 ---
@@ -1222,5 +1298,5 @@ Esse é o ponto que diferencia o MAX de um simples app de calendário.
 
 ## 34. Frase-guia
 
-> MAX não é uma agenda com IA.  
+> MAX não é uma agenda com IA.
 > MAX é um sistema pessoal de contexto, rotina e ação.
